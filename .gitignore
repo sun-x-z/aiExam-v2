@@ -1,0 +1,9 @@
+.vercel
+.next
+node_modules
+.npm-cache
+tmp
+Thumbs.db
+server.err.log
+server.out.log
+tsconfig.tsbuildinfo
