@@ -11,7 +11,7 @@ V3 与 V2 独立部署、独立数据库。V3 不连接 V2 数据库，所有运
 - `V2_API_TIMEOUT_MS`：默认 3500。
 - `V2_API_RETRY_COUNT`：默认 1。
 
-本地开发未配置 `V2_API_BASE_URL` 时，V3 会调用本项目内置 `/api/v2` 适配器，用旧 V2 导入表模拟 HTTP 返回，便于调试接口链路。
+本仓库是独立 V2 服务提供方，优先暴露版本化接口 `/api/v1/waybills/*` 给 V3 调用，并保留兼容路由 `/api/v2/waybills/*`。V3 本地联调应配置 `V2_API_BASE_URL=http://127.0.0.1:3001/api/v1`。
 
 ## 2. 鉴权与链路追踪
 
@@ -132,4 +132,3 @@ POST /waybills/{waybillNo}/exception-flags
 - 金额字段以字符串 decimal 返回，避免 JS number 精度问题。
 - 响应保留 `sourceUpdatedAt` 或 `etag`，供 V3 判断快照新鲜度。
 - 灰度阶段只给 V3 的 API Key 开放，观察日志成功率后再扩大调用方。
-

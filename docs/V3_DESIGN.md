@@ -46,7 +46,7 @@ V3 新增表在 [lib/server/v3-schema.ts](../lib/server/v3-schema.ts) 中自动 
 - `v3_approval_rules`：分级审批阈值配置。
 - `v3_users`：演示角色与权限边界。
 
-旧 V2 导入相关表保留，内置 `/api/v2/*` 仅作为本地 HTTP 适配器使用。
+在独立 V2 项目中，旧导入相关表继续作为 V2 主数据来源；对 V3 暴露 `/api/v1/waybills/*`，并保留 `/api/v2/waybills/*` 兼容路由。
 
 ## 4. 技术实现点
 
@@ -80,4 +80,3 @@ V3 新增表在 [lib/server/v3-schema.ts](../lib/server/v3-schema.ts) 中自动 
 - `GET /api/v3/sync-logs`
 - `POST /api/v3/maintenance`
 - `POST /api/v3/seed`
-
