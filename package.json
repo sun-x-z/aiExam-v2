@@ -1,8 +1,8 @@
 {
   "name": "ai-exam-v2",
   "private": true,
-  "version": "2.0.0",
-  "description": "Standalone V2 waybill import system and HTTP contract provider for AI Exam V3",
+  "version": "2.1.0",
+  "description": "Standalone V2 waybill import system with async processing and V3 HTTP contracts",
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1 --port 3001",
     "build": "next build",

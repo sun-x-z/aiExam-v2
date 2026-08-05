@@ -1,4 +1,4 @@
-# V3 调用 V2 系统间接口文档
+# V2 对 V3 的系统间接口文档
 
 ## 1. 接口原则
 
@@ -23,7 +23,7 @@ X-Request-ID: <uuid>
 Accept: application/json
 ```
 
-每次调用都会写入 `v3_sync_logs`：
+V2 响应会透传 `X-Request-ID`；V3 客户端负责将调用结果写入 `v3_sync_logs`：
 
 - request id
 - endpoint
