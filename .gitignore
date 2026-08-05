@@ -3,6 +3,7 @@
 node_modules
 .npm-cache
 tmp
+test-data/
 Thumbs.db
 server.err.log
 server.out.log

@@ -79,6 +79,40 @@ export async function saveParseRule(rule: ParseRule, id?: string) {
   };
 }
 
+export async function getParseRuleById(id: string) {
+  const result = await query<{
+    id: string;
+    name: string;
+    description: string | null;
+    file_kind: ParseRule["fileKind"];
+    rule: ParseRule;
+    ai_generated: boolean;
+    confidence: number | null;
+    created_at: string;
+    updated_at: string;
+  }>(
+    `SELECT id, name, description, file_kind, rule, ai_generated, confidence, created_at, updated_at
+     FROM public.parse_rules
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [id]
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description || "",
+    fileKind: row.file_kind,
+    rule: row.rule,
+    aiGenerated: row.ai_generated,
+    confidence: row.confidence ?? 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export async function deleteParseRule(id: string) {
   await query(`DELETE FROM public.parse_rules WHERE id = $1`, [id]);
 }

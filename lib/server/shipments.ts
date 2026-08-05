@@ -46,78 +46,92 @@ export async function updateBatchSummary(batchId: string, successCount: number, 
 
 export async function insertShipmentRows(batchId: string, rows: ImportRow[]) {
   return withClient(async (client) => {
-    const inserted: Array<Pick<ShipmentRecord, "id" | "sourceRowNumber" | "externalCode">> = [];
     const failures: Array<{ rowNumber: number; message: string; field: string }> = [];
-
-    for (const row of rows) {
-      const externalCode = String(row.values.externalCode || "").trim() || null;
-      const storeName = String(row.values.storeName || "").trim() || null;
-      const recipientName = String(row.values.recipientName || "").trim();
-      const recipientPhone = String(row.values.recipientPhone || "").trim();
-      const recipientAddress = String(row.values.recipientAddress || "").trim();
-      const skuCode = String(row.values.skuCode || "").trim();
-      const skuName = String(row.values.skuName || "").trim();
-      const skuQuantity = Number(row.values.skuQuantity);
-      const skuSpec = String(row.values.skuSpec || "").trim() || null;
-      const note = String(row.values.note || "").trim() || null;
-      const sourceSheetName = row.sourceSheetName || null;
-
+    const candidates = rows.filter((row) => {
       if (row.issues.length > 0) {
         failures.push({ rowNumber: row.sourceRowNumber, message: "存在校验错误，已跳过", field: "global" });
-        continue;
+        return false;
       }
+      return true;
+    });
 
-      try {
-        const duplicateCheck = externalCode
-          ? await client.query<{ id: number }>(
-              `SELECT id FROM public.shipments WHERE external_code = $1 AND sku_code = $2 LIMIT 1`,
-              [externalCode, skuCode]
-            )
-          : { rows: [] as Array<{ id: number }> };
-
-        if (externalCode && duplicateCheck.rows[0]) {
-          failures.push({ rowNumber: row.sourceRowNumber, message: "外部编码 + SKU 已存在于历史运单中", field: "externalCode" });
-          continue;
-        }
-
-        const result = await client.query<{
-          id: number;
-          batch_id: string;
-          external_code: string | null;
-          source_row_number: number;
-        }>(
-          `INSERT INTO public.shipments (
-            batch_id, external_code, store_name, recipient_name, recipient_phone, recipient_address,
-            sku_code, sku_name, sku_quantity, sku_spec, note, source_row_number, source_sheet_name,
-            sender_name, sender_phone, sender_address, weight_kg, package_count, temperature_zone
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'','','',1,1,'常温')
-          RETURNING id, batch_id, external_code, source_row_number`,
-          [
-            batchId,
-            externalCode,
-            storeName,
-            recipientName,
-            recipientPhone,
-            recipientAddress,
-            skuCode,
-            skuName,
-            skuQuantity,
-            skuSpec,
-            note,
-            row.sourceRowNumber,
-            sourceSheetName,
-          ]
-        );
-
-        inserted.push({
-          id: result.rows[0].id,
-          sourceRowNumber: result.rows[0].source_row_number,
-          externalCode: result.rows[0].external_code,
-        });
-      } catch (error) {
-        failures.push({ rowNumber: row.sourceRowNumber, message: error instanceof Error ? error.message : "插入失败", field: "global" });
-      }
+    if (!candidates.length) {
+      return { inserted: [], failures };
     }
+
+    const payload = candidates.map((row) => ({
+      rowNumber: row.sourceRowNumber,
+      sourceSheetName: row.sourceSheetName || "",
+      values: row.values,
+    }));
+
+    const duplicates = await client.query<{ row_number: number }>(
+      `WITH incoming AS (
+         SELECT (row_data->>'rowNumber')::int AS row_number,
+                NULLIF(TRIM(row_data->'values'->>'externalCode'), '') AS external_code,
+                TRIM(row_data->'values'->>'skuCode') AS sku_code
+         FROM jsonb_array_elements($1::jsonb) AS source(row_data)
+       )
+       SELECT incoming.row_number
+       FROM incoming
+       JOIN public.shipments shipment
+         ON shipment.external_code = incoming.external_code
+        AND shipment.sku_code = incoming.sku_code
+       WHERE incoming.external_code IS NOT NULL`,
+      [JSON.stringify(payload)]
+    );
+    const duplicateRows = new Set(duplicates.rows.map((row) => Number(row.row_number)));
+    for (const rowNumber of duplicateRows) {
+      failures.push({ rowNumber, message: "外部编码 + SKU 已存在于历史运单中", field: "externalCode" });
+    }
+
+    const insertPayload = payload.filter((row) => !duplicateRows.has(row.rowNumber));
+    if (!insertPayload.length) {
+      return { inserted: [], failures };
+    }
+
+    const result = await client.query<{
+      id: number;
+      external_code: string | null;
+      source_row_number: number;
+    }>(
+      `INSERT INTO public.shipments (
+         batch_id, external_code, store_name, recipient_name, recipient_phone, recipient_address,
+         sku_code, sku_name, sku_quantity, sku_spec, note, source_row_number, source_sheet_name,
+         sender_name, sender_phone, sender_address, weight_kg, package_count, temperature_zone
+       )
+       SELECT $1::uuid,
+              NULLIF(TRIM(row_data->'values'->>'externalCode'), ''),
+              NULLIF(TRIM(row_data->'values'->>'storeName'), ''),
+              TRIM(row_data->'values'->>'recipientName'),
+              TRIM(row_data->'values'->>'recipientPhone'),
+              TRIM(row_data->'values'->>'recipientAddress'),
+              TRIM(row_data->'values'->>'skuCode'),
+              TRIM(row_data->'values'->>'skuName'),
+              (row_data->'values'->>'skuQuantity')::numeric,
+              NULLIF(TRIM(row_data->'values'->>'skuSpec'), ''),
+              NULLIF(TRIM(row_data->'values'->>'note'), ''),
+              (row_data->>'rowNumber')::int,
+              NULLIF(row_data->>'sourceSheetName', ''),
+              '',
+              '',
+              '',
+              1,
+              1,
+              '常温'
+       FROM jsonb_array_elements($2::jsonb) AS source(row_data)
+       ON CONFLICT (external_code, sku_code)
+         WHERE external_code IS NOT NULL AND external_code <> '' AND sku_code IS NOT NULL AND sku_code <> ''
+       DO NOTHING
+       RETURNING id, external_code, source_row_number`,
+      [batchId, JSON.stringify(insertPayload)]
+    );
+
+    const inserted = result.rows.map((row) => ({
+      id: row.id,
+      sourceRowNumber: row.source_row_number,
+      externalCode: row.external_code,
+    }));
 
     return { inserted, failures };
   });

@@ -2,7 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import {
+  Activity,
+  AlertTriangle,
   ArrowRight,
+  BarChart3,
   Database,
   Download,
   FileSpreadsheet,
@@ -15,6 +18,7 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  Route,
 } from "lucide-react";
 import type { ImportField, ImportRow, ParsedWorkbookSource, ParseRule, ShipmentRecord } from "@/lib/types";
 import { EMPTY_IMPORT_VALUES, FIELD_LABELS, IMPORT_FIELDS } from "@/lib/import/constants";
@@ -55,7 +59,73 @@ type ParseRuleRecord = {
   updatedAt: string;
 };
 
-type ActivePage = "import" | "query";
+type ImportTaskView = {
+  taskId: string;
+  fileName: string;
+  sheetName: string;
+  status: "pending" | "processing" | "completed" | "partial_success" | "failed";
+  totalRows: number;
+  processedRows: number;
+  successRows: number;
+  failedRows: number;
+  totalBatches: number;
+  completedBatches: number;
+  traceId: string;
+  degraded: boolean;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+};
+
+type TaskErrorRecord = {
+  id: number;
+  unitId: string;
+  batchIndex: number;
+  rowNumber: number;
+  fieldName: string;
+  rawValue: string;
+  errorCode: string;
+  errorReason: string;
+  severity: "error" | "warning";
+  traceId: string;
+  createdAt: string;
+};
+
+type TaskBatchRecord = {
+  id: string;
+  unitId: string;
+  batchIndex: number;
+  startRow: number;
+  endRow: number;
+  status: string;
+  retryCount: number;
+  processedCount: number;
+  successCount: number;
+  failureCount: number;
+  errorMessage: string | null;
+};
+
+type MonitorSummary = {
+  throughput: Array<{ minute: string; successRows: number }>;
+  queueDepth: { batches: number; rows: number; level: "normal" | "warning"; available: boolean };
+  stageLatency: Record<string, number | null> | null;
+  errorDistribution: Array<{ errorCode: string; errorReason: string; count: number }>;
+  slowBatches: Array<{ taskId: string; unitId: string; batchIndex: number; totalDurationMs: number; status: string; traceId: string }>;
+  taskStatus: Array<{ status: string; count: number }>;
+};
+
+type TraceEventRecord = {
+  id: number;
+  taskId: string | null;
+  unitId: string | null;
+  eventName: string;
+  eventStatus: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  occurredAt: string;
+};
+
+type ActivePage = "import" | "tasks" | "monitor" | "trace" | "query";
 
 function makeEmptyRow(sourceRowNumber = 0): ImportRow {
   return {
@@ -124,6 +194,34 @@ function getRuleText(rule: ParseRule) {
   return JSON.stringify(rule, null, 2);
 }
 
+function statusLabel(status: string) {
+  const labels: Record<string, string> = {
+    pending: "等待中",
+    processing: "处理中",
+    completed: "已完成",
+    partial_success: "部分成功",
+    failed: "失败",
+    queued: "已入队",
+  };
+  return labels[status] || status;
+}
+
+function statusTone(status: string) {
+  if (status === "completed") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (status === "partial_success" || status === "queued" || status === "processing") return "border-amber-200 bg-amber-50 text-amber-700";
+  if (status === "failed") return "border-rose-200 bg-rose-50 text-rose-700";
+  return "border-slate-200 bg-slate-50 text-slate-700";
+}
+
+function formatDateTime(value?: string | null) {
+  return value ? new Date(value).toLocaleString("zh-CN") : "-";
+}
+
+function formatLatency(value: unknown) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? `${Math.round(number)} ms` : "-";
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -183,6 +281,24 @@ export function ImportWorkspace() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [previewPage, setPreviewPage] = useState(1);
   const [activePage, setActivePage] = useState<ActivePage>("import");
+  const [tasks, setTasks] = useState<ImportTaskView[]>([]);
+  const [activeTaskId, setActiveTaskId] = useState("");
+  const [activeTask, setActiveTask] = useState<ImportTaskView | null>(null);
+  const [taskErrors, setTaskErrors] = useState<{ items: TaskErrorRecord[]; total: number; page: number; pageSize: number }>({
+    items: [],
+    total: 0,
+    page: 1,
+    pageSize: 50,
+  });
+  const [taskBatches, setTaskBatches] = useState<TaskBatchRecord[]>([]);
+  const [taskLoading, setTaskLoading] = useState(false);
+  const [monitorSummary, setMonitorSummary] = useState<MonitorSummary | null>(null);
+  const [monitorLoading, setMonitorLoading] = useState(false);
+  const [errorBatchFilter, setErrorBatchFilter] = useState("");
+  const [errorCodeFilter, setErrorCodeFilter] = useState("");
+  const [traceIdInput, setTraceIdInput] = useState("");
+  const [traceEvents, setTraceEvents] = useState<TraceEventRecord[]>([]);
+  const [traceLoading, setTraceLoading] = useState(false);
 
   const validRowCount = useMemo(() => rows.filter((row) => row.issues.length === 0).length, [rows]);
   const invalidRowCount = rows.length - validRowCount;
@@ -194,7 +310,30 @@ export function ImportWorkspace() {
   useEffect(() => {
     void loadRules();
     void loadHistory(1);
+    void loadTasks();
   }, []);
+
+  useEffect(() => {
+    if (activePage === "tasks") void loadTasks();
+    if (activePage === "monitor") void loadMonitor();
+  }, [activePage]);
+
+  useEffect(() => {
+    if (!activeTaskId) return;
+    let stopped = false;
+
+    async function refresh() {
+      if (stopped) return;
+      await loadTaskDetail(activeTaskId, true);
+    }
+
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTaskId]);
 
   async function loadRules() {
     try {
@@ -223,6 +362,105 @@ export function ImportWorkspace() {
       setMessage(error instanceof Error ? error.message : "加载历史运单失败");
     } finally {
       setHistoryLoading(false);
+    }
+  }
+
+  async function loadTasks() {
+    try {
+      const payload = await fetchJson<{ tasks: ImportTaskView[] }>("/api/import-tasks?limit=30");
+      setTasks(payload.tasks);
+      if (!activeTaskId && payload.tasks[0]) {
+        setActiveTask(payload.tasks[0]);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载导入任务失败");
+    }
+  }
+
+  async function loadTaskDetail(taskId: string, runWorker = false) {
+    if (!taskId) return;
+    setTaskLoading(true);
+    try {
+      if (runWorker) {
+        await fetchJson("/api/import-worker/tick", {
+          method: "POST",
+          body: JSON.stringify({ workerLimit: 2, dispatchLimit: 20 }),
+        }).catch(() => null);
+      }
+
+      const errorParams = new URLSearchParams({ page: "1", page_size: "50" });
+      if (errorBatchFilter) errorParams.set("batch", errorBatchFilter);
+      if (errorCodeFilter) errorParams.set("error_code", errorCodeFilter);
+
+      const [taskPayload, errorPayload, batchPayload] = await Promise.all([
+        fetchJson<{ task: ImportTaskView }>(`/api/import-tasks/${taskId}`),
+        fetchJson<{ items: TaskErrorRecord[]; total: number; page: number; pageSize: number }>(`/api/import-tasks/${taskId}/errors?${errorParams.toString()}`),
+        fetchJson<{ batches: TaskBatchRecord[] }>(`/api/import-tasks/${taskId}/batches`),
+      ]);
+
+      setActiveTask(taskPayload.task);
+      setTraceIdInput(taskPayload.task.traceId);
+      setTaskErrors(errorPayload);
+      setTaskBatches(batchPayload.batches);
+      setSubmitProgress({
+        current: taskPayload.task.processedRows,
+        total: taskPayload.task.totalRows,
+        label: `${taskPayload.task.status} ${taskPayload.task.processedRows}/${taskPayload.task.totalRows}`,
+      });
+      if (["completed", "partial_success", "failed"].includes(taskPayload.task.status)) {
+        setSubmitSummary({ success: taskPayload.task.successRows, failure: taskPayload.task.failedRows });
+        await loadHistory(1);
+      }
+      await loadTasks();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载任务详情失败");
+    } finally {
+      setTaskLoading(false);
+    }
+  }
+
+  async function reloadTaskErrors(page = 1) {
+    const taskId = activeTaskId || activeTask?.taskId || "";
+    if (!taskId) return;
+    try {
+      const params = new URLSearchParams({ page: String(page), page_size: "50" });
+      if (errorBatchFilter) params.set("batch", errorBatchFilter);
+      if (errorCodeFilter) params.set("error_code", errorCodeFilter);
+      const payload = await fetchJson<{ items: TaskErrorRecord[]; total: number; page: number; pageSize: number }>(`/api/import-tasks/${taskId}/errors?${params.toString()}`);
+      setTaskErrors(payload);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载错误明细失败");
+    }
+  }
+
+  async function loadMonitor() {
+    setMonitorLoading(true);
+    try {
+      const payload = await fetchJson<MonitorSummary>("/api/import-monitor/summary");
+      setMonitorSummary(payload);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载导入监控失败");
+    } finally {
+      setMonitorLoading(false);
+    }
+  }
+
+  async function handleTraceSearch() {
+    const traceId = traceIdInput.trim() || activeTask?.traceId || "";
+    if (!traceId) {
+      setMessage("请输入 trace_id。");
+      return;
+    }
+
+    setTraceLoading(true);
+    try {
+      const payload = await fetchJson<{ events: TraceEventRecord[] }>(`/api/traces/${encodeURIComponent(traceId)}`);
+      setTraceEvents(payload.events);
+      setActivePage("trace");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Trace 查询失败");
+    } finally {
+      setTraceLoading(false);
     }
   }
 
@@ -404,64 +642,407 @@ export function ImportWorkspace() {
       setMessage("请先试解析数据。");
       return;
     }
-    if (rows.some((row) => row.issues.length > 0)) {
-      setMessage("存在错误行，请先修正后再提交。");
-      return;
-    }
 
     setIsSubmitting(true);
     setMessage("");
     setSubmitSummary(null);
     try {
       const rule = parseRuleFromDraft();
-      const batch = await fetchJson<{ batch: { id: string } }>("/api/import-batches", {
+      const payload = await fetchJson<{ task: ImportTaskView; task_id: string; trace_id: string }>("/api/import-tasks", {
         method: "POST",
         body: JSON.stringify({
           fileName: source?.fileName || "import.xlsx",
           sheetName: source?.sheets.map((sheet) => sheet.name).join(", ") || source?.fileKind || "-",
-          templateFingerprint: selectedRuleId || rule.name,
-          totalCount: rows.length,
+          ruleId: selectedRuleId || rule.id,
+          rule,
+          rows,
+          batchSize: 1000,
+          duplicatePolicy: "allow_new_task",
         }),
       });
 
-      const chunkSize = 100;
-      let successCount = 0;
-      let failureCount = 0;
-
-      for (let index = 0; index < rows.length; index += chunkSize) {
-        const chunk = rows.slice(index, index + chunkSize);
-        setSubmitProgress({
-          current: Math.min(index + chunk.length, rows.length),
-          total: rows.length,
-          label: `提交 ${Math.min(index + chunk.length, rows.length)}/${rows.length}`,
-        });
-
-        const result = await fetchJson<{ successCount: number; failureCount: number }>(
-          `/api/import-batches/${batch.batch.id}/chunks`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              rows: chunk,
-              successCount,
-              failureCount,
-              finalize: index + chunkSize >= rows.length,
-            }),
-          }
-        );
-
-        successCount = result.successCount;
-        failureCount = result.failureCount;
-      }
-
-      setSubmitSummary({ success: successCount, failure: failureCount });
-      setMessage(`提交完成：成功 ${successCount} 条，失败 ${failureCount} 条。`);
-      await loadHistory(1);
+      setActiveTaskId(payload.task_id);
+      setActiveTask(payload.task);
+      setTraceIdInput(payload.trace_id);
+      setSubmitProgress({ current: 0, total: payload.task.totalRows, label: "任务已创建，等待 Worker 处理" });
+      setMessage(`异步导入任务已创建：${payload.task_id}`);
+      setActivePage("tasks");
+      await loadTasks();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "提交失败");
     } finally {
       setIsSubmitting(false);
-      setSubmitProgress({ current: 0, total: 0, label: "" });
     }
+  }
+
+  function renderTasksPage() {
+    const progressTotal = activeTask?.totalRows || 0;
+    const progressCurrent = activeTask?.processedRows || 0;
+
+    return (
+      <section className="grid gap-4 xl:grid-cols-[340px_1fr]">
+        <Panel>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase text-[var(--muted)]">Import Tasks</p>
+              <h1 className="mt-1 text-xl font-semibold">异步导入任务</h1>
+            </div>
+            <button type="button" onClick={() => void loadTasks()} className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold">
+              <Activity className="h-4 w-4" />
+              刷新
+            </button>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {tasks.length ? (
+              tasks.map((task) => (
+                <button
+                  type="button"
+                  key={task.taskId}
+                  onClick={() => {
+                    setActiveTaskId(task.taskId);
+                    setActiveTask(task);
+                    setTraceIdInput(task.traceId);
+                    void loadTaskDetail(task.taskId);
+                  }}
+                  className={`w-full rounded-md border px-3 py-3 text-left ${activeTask?.taskId === task.taskId ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--line)] bg-white hover:border-[var(--line-strong)]"}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-semibold">{task.fileName}</span>
+                    <span className={`shrink-0 rounded border px-2 py-0.5 text-xs font-semibold ${statusTone(task.status)}`}>{statusLabel(task.status)}</span>
+                  </div>
+                  <div className="mt-2 text-xs text-[var(--muted)]">
+                    {task.processedRows}/{task.totalRows} 行 · {task.completedBatches}/{task.totalBatches} 批
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="rounded-md border border-[var(--line)] bg-slate-50 px-4 py-8 text-center text-sm text-[var(--muted)]">暂无任务</div>
+            )}
+          </div>
+        </Panel>
+
+        <div className="grid gap-4">
+          <Panel>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase text-[var(--muted)]">Task Detail</p>
+                <h2 className="mt-1 text-xl font-semibold">{activeTask?.fileName || "未选择任务"}</h2>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!activeTaskId || taskLoading}
+                  onClick={() => void loadTaskDetail(activeTaskId, true)}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50"
+                >
+                  {taskLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+                  Worker Tick
+                </button>
+                <button
+                  type="button"
+                  disabled={!activeTask?.traceId}
+                  onClick={() => void handleTraceSearch()}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50"
+                >
+                  <Route className="h-4 w-4" />
+                  Trace
+                </button>
+              </div>
+            </div>
+
+            {activeTask ? (
+              <>
+                <div className="mt-4 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+                  <SummaryLine label="task_id" value={activeTask.taskId} />
+                  <SummaryLine label="trace_id" value={activeTask.traceId} />
+                  <SummaryLine label="状态" value={statusLabel(activeTask.status)} />
+                  <SummaryLine label="总行数" value={String(activeTask.totalRows)} />
+                  <SummaryLine label="成功行" value={String(activeTask.successRows)} />
+                  <SummaryLine label="失败行" value={String(activeTask.failedRows)} />
+                </div>
+                <div className="mt-4 rounded-lg border border-[var(--line)] bg-white p-4">
+                  <ProgressBar label={`${activeTask.completedBatches}/${activeTask.totalBatches} 批完成`} current={progressCurrent} total={progressTotal} />
+                </div>
+                {activeTask.degraded ? (
+                  <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>SKU 校验已降级：本次导入未经过商品主数据完整校验，数据可能需要后续复核。</span>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <div className="mt-4 rounded-md border border-[var(--line)] bg-slate-50 px-4 py-10 text-center text-sm text-[var(--muted)]">选择左侧任务查看进度</div>
+            )}
+          </Panel>
+
+          {activeTask ? (
+            <section className="grid gap-4 2xl:grid-cols-[1fr_0.9fr]">
+              <Panel>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h2 className="text-xl font-semibold">错误明细</h2>
+                  <div className="flex flex-wrap gap-2">
+                    <input
+                      value={errorBatchFilter}
+                      onChange={(event) => setErrorBatchFilter(event.target.value)}
+                      className="h-9 w-24 rounded border border-[var(--line)] px-2 text-sm outline-none"
+                      placeholder="批次"
+                    />
+                    <select
+                      value={errorCodeFilter}
+                      onChange={(event) => setErrorCodeFilter(event.target.value)}
+                      className="h-9 rounded border border-[var(--line)] bg-white px-2 text-sm outline-none"
+                    >
+                      <option value="">全部错误码</option>
+                      {["E001", "E002", "E003", "E004", "E005", "E006", "E007", "E008", "W001"].map((code) => (
+                        <option key={code} value={code}>{code}</option>
+                      ))}
+                    </select>
+                    <button type="button" onClick={() => void reloadTaskErrors(1)} className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold">
+                      <Search className="h-4 w-4" />
+                      筛选
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 overflow-x-auto rounded-lg border border-[var(--line)] bg-white">
+                  <table className="min-w-[980px] border-separate border-spacing-0 text-sm">
+                    <thead>
+                      <tr>
+                        <Th>级别</Th>
+                        <Th>批次</Th>
+                        <Th>行号</Th>
+                        <Th>字段</Th>
+                        <Th>原始值</Th>
+                        <Th>错误码</Th>
+                        <Th>原因</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {taskErrors.items.length ? (
+                        taskErrors.items.map((item) => (
+                          <tr key={item.id} className={item.severity === "warning" ? "bg-amber-50" : "odd:bg-white even:bg-slate-50/60"}>
+                            <Td>{item.severity === "warning" ? "warning" : "error"}</Td>
+                            <Td>{item.batchIndex}</Td>
+                            <Td>{item.rowNumber}</Td>
+                            <Td>{item.fieldName}</Td>
+                            <Td>{item.rawValue || "-"}</Td>
+                            <Td>{item.errorCode}</Td>
+                            <Td>{item.errorReason}</Td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={7} className="px-6 py-10 text-center text-sm text-[var(--muted)]">暂无错误</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </Panel>
+
+              <Panel>
+                <h2 className="text-xl font-semibold">批次状态</h2>
+                <div className="mt-4 overflow-x-auto rounded-lg border border-[var(--line)] bg-white">
+                  <table className="min-w-[760px] border-separate border-spacing-0 text-sm">
+                    <thead>
+                      <tr>
+                        <Th>批次</Th>
+                        <Th>状态</Th>
+                        <Th>行范围</Th>
+                        <Th>成功</Th>
+                        <Th>失败</Th>
+                        <Th>重试</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {taskBatches.length ? (
+                        taskBatches.map((batch) => (
+                          <tr key={batch.id} className="odd:bg-white even:bg-slate-50/60">
+                            <Td>{batch.unitId}</Td>
+                            <Td><span className={`rounded border px-2 py-0.5 text-xs font-semibold ${statusTone(batch.status)}`}>{statusLabel(batch.status)}</span></Td>
+                            <Td>{batch.startRow}-{batch.endRow}</Td>
+                            <Td>{batch.successCount}</Td>
+                            <Td>{batch.failureCount}</Td>
+                            <Td>{batch.retryCount}</Td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={6} className="px-6 py-10 text-center text-sm text-[var(--muted)]">暂无批次</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </Panel>
+            </section>
+          ) : null}
+        </div>
+      </section>
+    );
+  }
+
+  function renderMonitorPage() {
+    const maxThroughput = Math.max(1, ...(monitorSummary?.throughput.map((item) => item.successRows) || [1]));
+    const latency: Record<string, number | null | undefined> = monitorSummary?.stageLatency || {};
+
+    return (
+      <div className="grid gap-4">
+        <Panel>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase text-[var(--muted)]">Import Monitor</p>
+              <h1 className="mt-1 text-xl font-semibold">导入监控</h1>
+            </div>
+            <button type="button" onClick={() => void loadMonitor()} className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold">
+              {monitorLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <BarChart3 className="h-4 w-4" />}
+              刷新
+            </button>
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-4">
+            <StatCard icon={<Activity className="h-4 w-4" />} title="队列批次" value={String(monitorSummary?.queueDepth.batches ?? 0)} />
+            <StatCard icon={<ListChecks className="h-4 w-4" />} title="积压行数" value={String(monitorSummary?.queueDepth.rows ?? 0)} />
+            <StatCard icon={<Database className="h-4 w-4" />} title="队列状态" value={monitorSummary?.queueDepth.level === "warning" ? "预警" : "正常"} />
+            <StatCard icon={<AlertTriangle className="h-4 w-4" />} title="错误类型" value={String(monitorSummary?.errorDistribution.length ?? 0)} />
+          </div>
+        </Panel>
+
+        <section className="grid gap-4 xl:grid-cols-2">
+          <Panel>
+            <h2 className="text-xl font-semibold">实时吞吐量</h2>
+            <div className="mt-4 space-y-3">
+              {(monitorSummary?.throughput.length ? monitorSummary.throughput : [{ minute: "-", successRows: 0 }]).map((item) => (
+                <div key={item.minute} className="grid grid-cols-[64px_1fr_80px] items-center gap-3 text-sm">
+                  <span className="text-[var(--muted)]">{item.minute}</span>
+                  <span className="h-3 overflow-hidden rounded-full bg-slate-100">
+                    <span className="block h-full bg-[var(--accent)]" style={{ width: `${Math.max(4, (item.successRows / maxThroughput) * 100)}%` }} />
+                  </span>
+                  <span className="text-right font-semibold">{item.successRows}</span>
+                </div>
+              ))}
+            </div>
+          </Panel>
+
+          <Panel>
+            <h2 className="text-xl font-semibold">阶段耗时分布</h2>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <SummaryLine label="解析 P95" value={formatLatency(latency.parse_p95)} />
+              <SummaryLine label="规则 P95" value={formatLatency(latency.rule_p95)} />
+              <SummaryLine label="校验 P95" value={formatLatency(latency.validate_p95)} />
+              <SummaryLine label="写入 P95" value={formatLatency(latency.insert_p95)} />
+              <SummaryLine label="解析 P99" value={formatLatency(latency.parse_p99)} />
+              <SummaryLine label="写入 P99" value={formatLatency(latency.insert_p99)} />
+            </div>
+          </Panel>
+        </section>
+
+        <section className="grid gap-4 xl:grid-cols-2">
+          <Panel>
+            <h2 className="text-xl font-semibold">错误类型分布</h2>
+            <div className="mt-4 overflow-x-auto rounded-lg border border-[var(--line)] bg-white">
+              <table className="min-w-[540px] border-separate border-spacing-0 text-sm">
+                <thead>
+                  <tr>
+                    <Th>错误码</Th>
+                    <Th>原因</Th>
+                    <Th>数量</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {monitorSummary?.errorDistribution.length ? (
+                    monitorSummary.errorDistribution.map((item) => (
+                      <tr key={item.errorCode} className="odd:bg-white even:bg-slate-50/60">
+                        <Td>{item.errorCode}</Td>
+                        <Td>{item.errorReason}</Td>
+                        <Td>{item.count}</Td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={3} className="px-6 py-10 text-center text-sm text-[var(--muted)]">暂无错误</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+
+          <Panel>
+            <h2 className="text-xl font-semibold">慢批次 TOP 10</h2>
+            <div className="mt-4 space-y-2">
+              {(monitorSummary?.slowBatches || []).map((batch) => (
+                <button
+                  type="button"
+                  key={`${batch.taskId}-${batch.unitId}`}
+                  onClick={() => {
+                    setActiveTaskId(batch.taskId);
+                    setTraceIdInput(batch.traceId);
+                    setActivePage("tasks");
+                  }}
+                  className="grid w-full grid-cols-[96px_1fr_96px] items-center gap-3 rounded-md border border-[var(--line)] bg-white px-3 py-2 text-left text-sm"
+                >
+                  <span className="font-semibold">{batch.unitId}</span>
+                  <span className="truncate text-[var(--muted)]">{batch.taskId}</span>
+                  <span className="text-right font-semibold">{batch.totalDurationMs} ms</span>
+                </button>
+              ))}
+              {!monitorSummary?.slowBatches.length ? <div className="rounded-md border border-[var(--line)] bg-slate-50 px-4 py-8 text-center text-sm text-[var(--muted)]">暂无批次日志</div> : null}
+            </div>
+          </Panel>
+        </section>
+      </div>
+    );
+  }
+
+  function renderTracePage() {
+    return (
+      <Panel>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase text-[var(--muted)]">Trace Search</p>
+            <h1 className="mt-1 text-xl font-semibold">链路检索</h1>
+          </div>
+          <div className="flex min-w-0 flex-1 justify-end gap-2">
+            <input
+              value={traceIdInput}
+              onChange={(event) => setTraceIdInput(event.target.value)}
+              className="h-9 min-w-0 max-w-[520px] flex-1 rounded border border-[var(--line)] px-3 text-sm outline-none"
+              placeholder="trace_id"
+            />
+            <button type="button" onClick={() => void handleTraceSearch()} className="inline-flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold">
+              {traceLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+              查询
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-3">
+          {traceEvents.length ? (
+            traceEvents.map((event) => (
+              <div key={event.id} className="rounded-md border border-[var(--line)] bg-white px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`rounded border px-2 py-0.5 text-xs font-semibold ${statusTone(event.eventStatus)}`}>{event.eventStatus}</span>
+                    <span className="font-semibold">{event.eventName}</span>
+                  </div>
+                  <span className="text-xs text-[var(--muted)]">{formatDateTime(event.occurredAt)}</span>
+                </div>
+                <p className="mt-2 text-sm text-slate-700">{event.message || "-"}</p>
+                <div className="mt-2 grid gap-2 text-xs text-[var(--muted)] md:grid-cols-3">
+                  <span>task_id: {event.taskId || "-"}</span>
+                  <span>unit_id: {event.unitId || "-"}</span>
+                  <span className="truncate">metadata: {JSON.stringify(event.metadata)}</span>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-[var(--line)] bg-slate-50 px-4 py-10 text-center text-sm text-[var(--muted)]">暂无 Trace 事件</div>
+          )}
+        </div>
+      </Panel>
+    );
   }
 
   return (
@@ -724,6 +1305,12 @@ export function ImportWorkspace() {
                   </div>
                 </Panel>
               </>
+            ) : activePage === "tasks" ? (
+              renderTasksPage()
+            ) : activePage === "monitor" ? (
+              renderMonitorPage()
+            ) : activePage === "trace" ? (
+              renderTracePage()
             ) : (
               <Panel>
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -823,6 +1410,9 @@ function TopBar() {
 function SideNav({ activePage, onChange }: { activePage: ActivePage; onChange: (page: ActivePage) => void }) {
   const navItems: Array<{ label: string; page: ActivePage; icon: ReactNode }> = [
     { label: "运单智能导入", page: "import", icon: <Upload className="h-5 w-5" /> },
+    { label: "异步任务进度", page: "tasks", icon: <Activity className="h-5 w-5" /> },
+    { label: "导入监控", page: "monitor", icon: <BarChart3 className="h-5 w-5" /> },
+    { label: "链路检索", page: "trace", icon: <Route className="h-5 w-5" /> },
     { label: "导入运单查询", page: "query", icon: <Search className="h-5 w-5" /> },
   ];
 
